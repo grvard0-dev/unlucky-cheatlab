@@ -1,5 +1,5 @@
 --!nonstrict
--- UNLUCKY CHEAT LAB v1.1 | Самостоятельный клиентский Lua-скрипт.
+-- UNLUCKY CHEAT LAB v1.2 | Самостоятельный клиентский Lua-скрипт.
 -- Запуск: загрузи свой тестовый place, вставь ВЕСЬ файл в Lua-окно исполнителя
 -- и нажми Execute. Нужен доступ к обычному Roblox client API: game/Instance/task.
 -- Не зависит от переменной script и не требует Roblox Studio.
@@ -54,6 +54,7 @@ local savedSpeed, savedJump, savedFly
 local walkValue, flyAttachment, flyMover
 local waypoint, smoothMove
 local generation, closed = 0, false
+local cleanupExtras = function() end
 local gui, panel, statusLabel, telemetryLabel, profileButton, reopenButton
 local toggleButtons, valueBoxes = {}, {}
 
@@ -420,6 +421,7 @@ end
 
 local function cleanup()
     if closed then return end
+    cleanupExtras()
     resetFeatures()
     closed = true
     generation = generation + 1
@@ -553,6 +555,178 @@ connect(RunService.Heartbeat, function(dt)
         lastPosition, telemetryCharacter = nil, nil
     end
 end)
+
+
+-- Collectible overlay: discover replicated interaction prompts without invoking them.
+local lootEnabled = false
+local forceMouse = false
+local mouseSaved
+local lootMarkers, lootPrompts = {}, {}
+local lootFolder = Instance.new("Folder")
+lootFolder.Name = "CheatLabLocalMarkers"
+lootFolder.Parent = Workspace
+local mouseButton = button("Мышь: меню / M", 16, 122, 190, 34, function()
+    forceMouse = not forceMouse
+end, gui)
+local lootButton
+local function clearMarkers()
+    for target, marker in pairs(lootMarkers) do
+        marker.highlight:Destroy()
+        marker.billboard:Destroy()
+        lootMarkers[target] = nil
+    end
+end
+lootButton = button("Предметы: ВЫКЛ / L", 16, 164, 190, 34, function()
+    lootEnabled = not lootEnabled
+    if not lootEnabled then clearMarkers() end
+end, gui)
+-- Modal releases the standard first-person cursor while the menu is visible.
+local mouseModal = create("TextButton", {
+    Name = "CursorRelease", Text = "", Modal = true, Active = false,
+    BackgroundTransparency = 1, Size = UDim2.fromOffset(1, 1),
+    Position = UDim2.fromOffset(0, 0)
+}, panel)
+local mouseBinding = "UnluckyCheatLabCursor"
+RunService:BindToRenderStep(mouseBinding, Enum.RenderPriority.Last.Value + 1, function()
+    if closed then return end
+    local release = panel.Visible or forceMouse
+    mouseModal.Modal = release
+    if release then
+        if not mouseSaved then
+            mouseSaved = { behavior = UserInputService.MouseBehavior,
+                icon = UserInputService.MouseIconEnabled }
+        end
+        UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+        UserInputService.MouseIconEnabled = true
+    elseif mouseSaved then
+        UserInputService.MouseBehavior = mouseSaved.behavior
+        UserInputService.MouseIconEnabled = mouseSaved.icon
+        mouseSaved = nil
+    end
+    mouseButton.Text = forceMouse and "Мышь: свободная / M" or "Мышь: меню / M"
+end)
+local lootWords = { "steal", "pick up", "pickup", "collect", "grab",
+    "украсть", "Украсть", "забрать", "Забрать", "подобрать", "Подобрать",
+    "взять", "Взять", "собрать", "Собрать" }
+local function isLoot(prompt)
+    if not prompt.Enabled or not prompt:IsDescendantOf(Workspace) then return false end
+    local action = string.lower(prompt.ActionText)
+    for _, word in ipairs(lootWords) do
+        if string.find(action, word, 1, true) then return true end
+    end
+    return false
+end
+local function targetFor(prompt)
+    local node = prompt.Parent
+    while node and node ~= Workspace do
+        if node:IsA("BasePart") or node:IsA("Model") then
+            local ancestor = node
+            while ancestor and ancestor ~= Workspace do
+                if ancestor:IsA("Model") and ancestor:FindFirstChildOfClass("Humanoid") then
+                    return nil
+                end
+                ancestor = ancestor.Parent
+            end
+            return node
+        end
+        node = node.Parent
+    end
+end
+local function trackPrompt(item)
+    if item:IsA("ProximityPrompt") then lootPrompts[item] = true end
+end
+connect(Workspace.DescendantAdded, trackPrompt)
+connect(Workspace.DescendantRemoving, function(item) lootPrompts[item] = nil end)
+task.spawn(function()
+    for index, item in ipairs(Workspace:GetDescendants()) do
+        if closed then return end
+        if item.Parent then trackPrompt(item) end
+        if index % 500 == 0 then task.wait() end
+    end
+end)
+connect(UserInputService.InputBegan, function(input, processed)
+    if processed or UserInputService:GetFocusedTextBox() then return end
+    if input.KeyCode == Enum.KeyCode.M then forceMouse = not forceMouse end
+    if input.KeyCode == Enum.KeyCode.L then
+        lootEnabled = not lootEnabled
+        if not lootEnabled then clearMarkers() end
+    end
+end)
+local lootElapsed = 0
+connect(RunService.Heartbeat, function(dt)
+    lootElapsed = lootElapsed + dt
+    if lootElapsed < 0.5 then return end
+    lootElapsed = 0
+    if not lootEnabled or not ready() then
+        clearMarkers()
+        lootButton.Text = lootEnabled and "Предметы: ожидание / L" or "Предметы: ВЫКЛ / L"
+        return
+    end
+    local candidates, seen = {}, {}
+    for prompt in pairs(lootPrompts) do
+        if not prompt.Parent then
+            lootPrompts[prompt] = nil
+        elseif isLoot(prompt) then
+            local target = targetFor(prompt)
+            local part = target and (target:IsA("BasePart") and target
+                or target.PrimaryPart or target:FindFirstChildWhichIsA("BasePart", true))
+            if part and not seen[target] then
+                local distance = (part.Position - root.Position).Magnitude
+                if distance == distance and distance <= 1000 then
+                    seen[target] = true
+                    candidates[#candidates + 1] = { target = target, part = part,
+                        distance = distance, name = prompt.ObjectText ~= "" and prompt.ObjectText or target.Name }
+                end
+            end
+        end
+    end
+    table.sort(candidates, function(a, b) return a.distance < b.distance end)
+    local selected = {}
+    for index = 1, math.min(24, #candidates) do
+        selected[candidates[index].target] = true
+    end
+    for target, marker in pairs(lootMarkers) do
+        if not selected[target] then
+            marker.highlight:Destroy()
+            marker.billboard:Destroy()
+            lootMarkers[target] = nil
+        end
+    end
+    for index = 1, math.min(24, #candidates) do
+        local item = candidates[index]
+        local marker = lootMarkers[item.target]
+        if not marker then
+            local highlight = create("Highlight", {
+                Adornee = item.target, DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+                FillColor = Color3.fromRGB(255, 197, 70), FillTransparency = 0.65,
+                OutlineColor = Color3.fromRGB(255, 230, 140), OutlineTransparency = 0
+            }, lootFolder)
+            local billboard = create("BillboardGui", {
+                Adornee = item.part, AlwaysOnTop = true, MaxDistance = 1000,
+                Size = UDim2.fromOffset(200, 40), StudsOffsetWorldSpace = Vector3.new(0, 2, 0)
+            }, gui)
+            local caption = label("", 0, 0, 200, 40, 13, billboard)
+            caption.TextXAlignment = Enum.TextXAlignment.Center
+            caption.TextStrokeTransparency = 0.25
+            caption.TextColor3 = Color3.fromRGB(255, 224, 125)
+            marker = { highlight = highlight, billboard = billboard, caption = caption }
+            lootMarkers[item.target] = marker
+        end
+        marker.billboard.Adornee = item.part
+        marker.caption.Text = string.sub(item.name, 1, 100) .. string.format(" · %.0f studs", item.distance)
+    end
+    lootButton.Text = string.format("Предметы: %d / L", math.min(24, #candidates))
+end)
+cleanupExtras = function()
+    RunService:UnbindFromRenderStep(mouseBinding)
+    if mouseSaved then
+        UserInputService.MouseBehavior = mouseSaved.behavior
+        UserInputService.MouseIconEnabled = mouseSaved.icon
+        mouseSaved = nil
+    end
+    clearMarkers()
+    lootFolder:Destroy()
+end
 
 connect(shutdown.Event, cleanup)
 -- У исполнителя переменной script может не быть. Время жизни привязано к самой панели.
